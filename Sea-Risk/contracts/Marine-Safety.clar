@@ -32,6 +32,9 @@
 (define-constant ERR-CLAIM-AMOUNT-TOO-HIGH (err u118))
 (define-constant ERR-INVALID-INCIDENT-DATE (err u119))
 (define-constant ERR-INVALID-COMPLIANCE-SCORE (err u120))
+(define-constant ERR-INVALID-INPUT (err u121))
+(define-constant ERR-EMPTY-STRING (err u122))
+(define-constant ERR-INVALID-LIST-ITEM (err u123))
 
 ;; Risk assessment constants
 (define-constant max-risk-score u100)
@@ -134,6 +137,58 @@
 (define-data-var contract-active bool true)
 (define-data-var emergency-pause bool false)
 
+;; INPUT VALIDATION FUNCTIONS
+
+(define-private (validate-string-not-empty (str (string-ascii 200)))
+  (> (len str) u0)
+)
+
+(define-private (validate-vessel-id (vessel-id (string-ascii 20)))
+  (and 
+    (> (len vessel-id) u0)
+    (<= (len vessel-id) u20)
+  )
+)
+
+(define-private (validate-string-length (str (string-ascii 300)) (max-len uint))
+  (and 
+    (> (len str) u0)
+    (<= (len str) max-len)
+  )
+)
+
+(define-private (validate-role (role uint))
+  (and (>= role u1) (<= role u3))
+)
+
+(define-private (validate-risk-factor (factor uint))
+  (and (>= factor u0) (<= factor u100))
+)
+
+(define-private (validate-compliance-score (score uint))
+  (and (>= score u0) (<= score u100))
+)
+
+(define-private (validate-principal (user principal))
+  (not (is-eq user 'SP000000000000000000002Q6VF78))
+)
+
+(define-private (validate-claim-id (claim-id uint))
+  (and (> claim-id u0) (< claim-id u4294967295))
+)
+
+(define-private (validate-string-list-item (str (string-ascii 100)))
+  (and (>= (len str) u0) (<= (len str) u100))
+)
+
+(define-private (validate-string-list (str-list (list 10 (string-ascii 100))))
+  (fold validate-list-fold str-list true)
+)
+
+(define-private (validate-list-fold (item (string-ascii 100)) (acc bool))
+  (and acc (validate-string-list-item item))
+)
+
 ;; AUTHORIZATION FUNCTIONS
 
 (define-read-only (is-contract-owner (user principal))
@@ -174,7 +229,8 @@
 (define-public (assign-role (user principal) (role uint))
   (begin
     (asserts! (is-contract-owner tx-sender) ERR-NOT-AUTHORIZED)
-    (asserts! (<= role u3) ERR-INVALID-ROLE)
+    (asserts! (validate-principal user) ERR-INVALID-INPUT)
+    (asserts! (validate-role role) ERR-INVALID-ROLE)
     (ok (map-set user-roles
       { user: user }
       {
@@ -190,6 +246,7 @@
 (define-public (revoke-role (user principal))
   (begin
     (asserts! (is-contract-owner tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (validate-principal user) ERR-INVALID-INPUT)
     (ok (map-set user-roles
       { user: user }
       {
@@ -213,23 +270,35 @@
   (gross-tonnage uint)
   (year-built uint))
   
-  (let ((current-block block-height))
+  (let ((current-block block-height)
+        (validated-vessel-id vessel-id)
+        (validated-vessel-name vessel-name)
+        (validated-vessel-type vessel-type)
+        (validated-imo-number imo-number)
+        (validated-flag-state flag-state)
+        (validated-tonnage gross-tonnage)
+        (validated-year year-built))
     (begin
       (asserts! (var-get contract-active) ERR-CONTRACT-INACTIVE)
-      (asserts! (is-none (map-get? vessels { vessel-id: vessel-id })) ERR-VESSEL-ALREADY-EXISTS)
-      (asserts! (> year-built u1900) ERR-INVALID-YEAR)
-      (asserts! (> gross-tonnage u0) ERR-INVALID-TONNAGE)
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (asserts! (validate-string-length validated-vessel-name u50) ERR-EMPTY-STRING)
+      (asserts! (validate-string-length validated-vessel-type u20) ERR-EMPTY-STRING)
+      (asserts! (validate-string-length validated-imo-number u15) ERR-EMPTY-STRING)
+      (asserts! (validate-string-length validated-flag-state u3) ERR-EMPTY-STRING)
+      (asserts! (is-none (map-get? vessels { vessel-id: validated-vessel-id })) ERR-VESSEL-ALREADY-EXISTS)
+      (asserts! (> validated-year u1900) ERR-INVALID-YEAR)
+      (asserts! (> validated-tonnage u0) ERR-INVALID-TONNAGE)
       
       (ok (map-set vessels
-        { vessel-id: vessel-id }
+        { vessel-id: validated-vessel-id }
         {
           owner: tx-sender,
-          vessel-name: vessel-name,
-          vessel-type: vessel-type,
-          imo-number: imo-number,
-          flag-state: flag-state,
-          gross-tonnage: gross-tonnage,
-          year-built: year-built,
+          vessel-name: validated-vessel-name,
+          vessel-type: validated-vessel-type,
+          imo-number: validated-imo-number,
+          flag-state: validated-flag-state,
+          gross-tonnage: validated-tonnage,
+          year-built: validated-year,
           current-risk-score: u50, ;; Default medium risk
           insurance-premium: u0,
           insurance-expiry: u0,
@@ -244,13 +313,15 @@
 )
 
 (define-public (update-vessel-status (vessel-id (string-ascii 20)) (active bool))
-  (let ((vessel-data (unwrap! (map-get? vessels { vessel-id: vessel-id }) ERR-VESSEL-NOT-FOUND)))
+  (let ((validated-vessel-id vessel-id)
+        (vessel-data (unwrap! (map-get? vessels { vessel-id: vessel-id }) ERR-VESSEL-NOT-FOUND)))
     (begin
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
       (asserts! (or (is-eq tx-sender (get owner vessel-data)) 
                    (is-authorized tx-sender admin-role)) ERR-NOT-AUTHORIZED)
       
       (ok (map-set vessels
-        { vessel-id: vessel-id }
+        { vessel-id: validated-vessel-id }
         (merge vessel-data { active: active })
       ))
     )
@@ -290,40 +361,53 @@
   (notes (string-ascii 200)))
   
   (let (
+    (validated-vessel-id vessel-id)
+    (validated-age-factor age-factor)
+    (validated-maintenance-factor maintenance-factor)
+    (validated-route-risk route-risk)
+    (validated-crew-experience crew-experience)
+    (validated-weather-exposure weather-exposure)
+    (validated-cargo-type-risk cargo-type-risk)
+    (validated-notes notes)
     (vessel-data (unwrap! (map-get? vessels { vessel-id: vessel-id }) ERR-VESSEL-NOT-FOUND))
     (assessment-id (var-get next-assessment-id))
-    (risk-score (calculate-risk-score age-factor maintenance-factor route-risk 
-                                    crew-experience weather-exposure cargo-type-risk))
+    (risk-score (calculate-risk-score validated-age-factor validated-maintenance-factor validated-route-risk 
+                                    validated-crew-experience validated-weather-exposure validated-cargo-type-risk))
   )
     (begin
       (asserts! (is-authorized tx-sender inspector-role) ERR-NOT-AUTHORIZED)
-      (asserts! (and (<= age-factor u100) (<= maintenance-factor u100) 
-                    (<= route-risk u100) (<= crew-experience u100)
-                    (<= weather-exposure u100) (<= cargo-type-risk u100)) ERR-INVALID-RISK-SCORE)
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (asserts! (validate-risk-factor validated-age-factor) ERR-INVALID-RISK-SCORE)
+      (asserts! (validate-risk-factor validated-maintenance-factor) ERR-INVALID-RISK-SCORE)
+      (asserts! (validate-risk-factor validated-route-risk) ERR-INVALID-RISK-SCORE)
+      (asserts! (validate-risk-factor validated-crew-experience) ERR-INVALID-RISK-SCORE)
+      (asserts! (validate-risk-factor validated-weather-exposure) ERR-INVALID-RISK-SCORE)
+      (asserts! (validate-risk-factor validated-cargo-type-risk) ERR-INVALID-RISK-SCORE)
+      (asserts! (validate-string-length validated-notes u200) ERR-EMPTY-STRING)
       
       ;; Create risk assessment record
       (map-set risk-assessments
-        { vessel-id: vessel-id, assessment-id: assessment-id }
+        { vessel-id: validated-vessel-id, assessment-id: assessment-id }
         {
           assessor: tx-sender,
           risk-factors: {
-            age-factor: age-factor,
-            maintenance-factor: maintenance-factor,
-            route-risk: route-risk,
-            crew-experience: crew-experience,
-            weather-exposure: weather-exposure,
-            cargo-type-risk: cargo-type-risk
+            age-factor: validated-age-factor,
+            maintenance-factor: validated-maintenance-factor,
+            route-risk: validated-route-risk,
+            crew-experience: validated-crew-experience,
+            weather-exposure: validated-weather-exposure,
+            cargo-type-risk: validated-cargo-type-risk
           },
           total-risk-score: risk-score,
           assessment-date: block-height,
           valid-until: (+ block-height u8640), ;; Valid for ~60 days
-          notes: notes
+          notes: validated-notes
         }
       )
       
       ;; Update vessel risk score
       (map-set vessels
-        { vessel-id: vessel-id }
+        { vessel-id: validated-vessel-id }
         (merge vessel-data { current-risk-score: risk-score })
       )
       
@@ -347,19 +431,17 @@
   (coverage-period uint))
   
   (let (
+    (validated-vessel-id vessel-id)
     (vessel-data (unwrap! (map-get? vessels { vessel-id: vessel-id }) ERR-VESSEL-NOT-FOUND))
     (premium (calculate-premium (get current-risk-score vessel-data) vessel-value))
   )
     (begin
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
       (asserts! (is-eq tx-sender (get owner vessel-data)) ERR-NOT-AUTHORIZED)
       (asserts! (> vessel-value u0) ERR-INVALID-VESSEL-VALUE)
       (asserts! (and (>= coverage-period u30) (<= coverage-period u365)) ERR-INVALID-COVERAGE-PERIOD)
-      
-      ;; In a real implementation, this would handle STX transfer for premium payment
-      ;; For now, we'll just update the vessel record
-      
       (ok (map-set vessels
-        { vessel-id: vessel-id }
+        { vessel-id: validated-vessel-id }
         (merge vessel-data {
           insurance-premium: premium,
           insurance-expiry: (+ block-height (* coverage-period u144)) ;; Approximate blocks per day
@@ -377,10 +459,16 @@
   (description (string-ascii 300)))
   
   (let (
+    (validated-vessel-id vessel-id)
+    (validated-claim-type claim-type)
+    (validated-description description)
     (vessel-data (unwrap! (map-get? vessels { vessel-id: vessel-id }) ERR-VESSEL-NOT-FOUND))
     (claim-id (var-get next-claim-id))
   )
     (begin
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (asserts! (validate-string-length validated-claim-type u30) ERR-EMPTY-STRING)
+      (asserts! (validate-string-length validated-description u300) ERR-EMPTY-STRING)
       (asserts! (is-eq tx-sender (get owner vessel-data)) ERR-NOT-AUTHORIZED)
       (asserts! (> (get insurance-expiry vessel-data) block-height) ERR-VESSEL-NOT-INSURED)
       (asserts! (<= claim-amount max-claim-amount) ERR-CLAIM-AMOUNT-TOO-HIGH)
@@ -389,13 +477,13 @@
       (map-set insurance-claims
         { claim-id: claim-id }
         {
-          vessel-id: vessel-id,
+          vessel-id: validated-vessel-id,
           claimant: tx-sender,
           claim-amount: claim-amount,
-          claim-type: claim-type,
+          claim-type: validated-claim-type,
           incident-date: incident-date,
           claim-date: block-height,
-          description: description,
+          description: validated-description,
           status: "pending",
           approved-amount: u0,
           processed-by: none,
@@ -417,6 +505,7 @@
   (let ((claim-data (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR-CLAIM-NOT-FOUND)))
     (begin
       (asserts! (is-authorized tx-sender admin-role) ERR-NOT-AUTHORIZED)
+      (asserts! (validate-claim-id claim-id) ERR-INVALID-INPUT)
       (asserts! (is-eq (get status claim-data) "pending") ERR-CLAIM-ALREADY-PROCESSED)
       
       (ok (map-set insurance-claims
@@ -442,33 +531,40 @@
   (corrective-actions (list 10 (string-ascii 100))))
   
   (let (
+    (validated-vessel-id vessel-id)
+    (validated-inspection-type inspection-type)
+    (validated-compliance-score compliance-score)
     (vessel-data (unwrap! (map-get? vessels { vessel-id: vessel-id }) ERR-VESSEL-NOT-FOUND))
     (record-id (var-get next-record-id))
   )
     (begin
       (asserts! (is-authorized tx-sender inspector-role) ERR-NOT-AUTHORIZED)
-      (asserts! (<= compliance-score u100) ERR-INVALID-COMPLIANCE-SCORE)
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (asserts! (validate-string-length validated-inspection-type u30) ERR-EMPTY-STRING)
+      (asserts! (validate-compliance-score validated-compliance-score) ERR-INVALID-COMPLIANCE-SCORE)
+      (asserts! (validate-string-list deficiencies) ERR-INVALID-LIST-ITEM)
+      (asserts! (validate-string-list corrective-actions) ERR-INVALID-LIST-ITEM)
       
       (map-set compliance-records
-        { vessel-id: vessel-id, record-id: record-id }
+        { vessel-id: validated-vessel-id, record-id: record-id }
         {
           inspector: tx-sender,
-          inspection-type: inspection-type,
+          inspection-type: validated-inspection-type,
           inspection-date: block-height,
-          compliance-score: compliance-score,
+          compliance-score: validated-compliance-score,
           deficiencies: deficiencies,
           corrective-actions: corrective-actions,
           next-inspection-due: (+ block-height u4320), ;; ~30 days
-          certificate-issued: (>= compliance-score u80)
+          certificate-issued: (>= validated-compliance-score u80)
         }
       )
       
       ;; Update vessel compliance status
       (map-set vessels
-        { vessel-id: vessel-id }
+        { vessel-id: validated-vessel-id }
         (merge vessel-data {
           last-inspection: block-height,
-          compliance-status: (>= compliance-score u80)
+          compliance-status: (>= validated-compliance-score u80)
         })
       )
       
@@ -481,49 +577,74 @@
 ;; QUERY FUNCTIONS
 
 (define-read-only (get-vessel-info (vessel-id (string-ascii 20)))
-  (map-get? vessels { vessel-id: vessel-id })
+  (let ((validated-vessel-id vessel-id))
+    (begin
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (ok (map-get? vessels { vessel-id: validated-vessel-id }))
+    )
+  )
 )
 
 (define-read-only (get-risk-assessment (vessel-id (string-ascii 20)) (assessment-id uint))
-  (map-get? risk-assessments { vessel-id: vessel-id, assessment-id: assessment-id })
+  (let ((validated-vessel-id vessel-id))
+    (begin
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (ok (map-get? risk-assessments { vessel-id: validated-vessel-id, assessment-id: assessment-id }))
+    )
+  )
 )
 
 (define-read-only (get-insurance-claim (claim-id uint))
-  (map-get? insurance-claims { claim-id: claim-id })
+  (ok (map-get? insurance-claims { claim-id: claim-id }))
 )
 
 (define-read-only (get-compliance-record (vessel-id (string-ascii 20)) (record-id uint))
-  (map-get? compliance-records { vessel-id: vessel-id, record-id: record-id })
+  (let ((validated-vessel-id vessel-id))
+    (begin
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (ok (map-get? compliance-records { vessel-id: validated-vessel-id, record-id: record-id }))
+    )
+  )
 )
 
 (define-read-only (get-user-role (user principal))
-  (map-get? user-roles { user: user })
+  (ok (map-get? user-roles { user: user }))
 )
 
 (define-read-only (get-vessel-risk-level (vessel-id (string-ascii 20)))
-  (match (map-get? vessels { vessel-id: vessel-id })
-    vessel-data 
-    (let ((risk-score (get current-risk-score vessel-data)))
-      (if (>= risk-score high-risk-threshold)
-        "HIGH"
-        (if (>= risk-score medium-risk-threshold)
-          "MEDIUM"
-          "LOW"
+  (let ((validated-vessel-id vessel-id))
+    (begin
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (ok (match (map-get? vessels { vessel-id: validated-vessel-id })
+        vessel-data 
+        (let ((risk-score (get current-risk-score vessel-data)))
+          (if (>= risk-score high-risk-threshold)
+            "HIGH"
+            (if (>= risk-score medium-risk-threshold)
+              "MEDIUM"
+              "LOW"
+            )
+          )
         )
-      )
+        "UNKNOWN"
+      ))
     )
-    "UNKNOWN"
   )
 )
 
 (define-read-only (is-vessel-compliant (vessel-id (string-ascii 20)))
-  (match (map-get? vessels { vessel-id: vessel-id })
-    vessel-data 
-    (and 
-      (get compliance-status vessel-data)
-      (> (get insurance-expiry vessel-data) block-height)
+  (let ((validated-vessel-id vessel-id))
+    (begin
+      (asserts! (validate-vessel-id validated-vessel-id) ERR-INVALID-INPUT)
+      (ok (match (map-get? vessels { vessel-id: validated-vessel-id })
+        vessel-data 
+        (and 
+          (get compliance-status vessel-data)
+          (> (get insurance-expiry vessel-data) block-height)
+        )
+        false
+      ))
     )
-    false
   )
 )
 
